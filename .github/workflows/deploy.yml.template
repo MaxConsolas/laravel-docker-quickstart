@@ -1,0 +1,250 @@
+name: Build and Deploy
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production' || github.ref_name) }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, staging ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+env:
+  REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+  IMAGE_NAME: ${{ secrets.DOCKER_IMAGE_PREFIX }}
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Determine environment name
+        id: set-env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            ENV="production"
+          else
+            ENV="${{ github.event.inputs.environment || github.ref_name }}"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "Using environment: $ENV"
+
+  generate-build-tag:
+    needs: [determine-environment]
+    runs-on: ubuntu-latest
+    outputs:
+      build-tag: ${{ steps.generate-tag.outputs.tag }}
+    steps:
+      - name: Generate build tag
+        id: generate-tag
+        run: |
+          TAG="${{ needs.determine-environment.outputs.environment }}-$(date +%Y-%m-%d_%H-%M-%S)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Generated build tag: $TAG"
+
+  build-backend:
+    needs: [determine-environment, generate-build-tag]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      date-tag: ${{ needs.generate-build-tag.outputs.build-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/back
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ needs.generate-build-tag.outputs.build-tag }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./build/backend/Dockerfile.optimized
+          target: back
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  build-nginx:
+    needs: [determine-environment, generate-build-tag]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      date-tag: ${{ needs.generate-build-tag.outputs.build-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nginx
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ needs.generate-build-tag.outputs.build-tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push nginx image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./build/backend/Dockerfile.optimized
+          target: nginx
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  build-frontend:
+    needs: [determine-environment, generate-build-tag]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      date-tag: ${{ needs.generate-build-tag.outputs.build-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/front
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ needs.generate-build-tag.outputs.build-tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./build/frontend/Dockerfile.optimized
+          target: runner
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://${{ vars.BACKEND_DOMAIN }}/api
+            NEXT_PUBLIC_HOST=https://${{ vars.FRONT_DOMAIN }}
+            SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    needs: [determine-environment, build-backend, build-nginx, build-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' || github.event.inputs.environment
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Set version and registry
+            export VERSION=${{ github.sha }}
+            export REGISTRY=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            export COMPOSE_PROJECT_NAME=puls-${{ needs.determine-environment.outputs.environment }}
+            export ENVIRONMENT=${{ needs.determine-environment.outputs.environment }}
+            
+            # Set domain variables for docker-compose
+            export BACK_DOMAIN="${{ vars.BACKEND_DOMAIN }}"
+            export FRONT_DOMAIN="${{ vars.FRONT_DOMAIN }}"
+            export IMGPROXY_DOMAIN="${{ vars.IMGPROXY_DOMAIN }}"
+            export S3_DOMAIN="${{ vars.S3_DOMAIN }}"
+            export MAIL_FROM_ADDRESS="${{ vars.MAIL_FROM_ADDRESS }}"
+            export MAIL_FROM_NAME="${{ vars.MAIL_FROM_NAME }}"
+            
+            # Set specific image tags from this pipeline (use extracted date tags)
+            export BACK_TAG=${{ needs.build-backend.outputs.date-tag }}
+            export NGINX_TAG=${{ needs.build-nginx.outputs.date-tag }}
+            export FRONT_TAG=${{ needs.build-frontend.outputs.date-tag }}
+
+            cd /opt/puls-${ENVIRONMENT}
+
+            # Login to registry
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login ${{ env.REGISTRY }} -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+            
+            # Pull specific images from this pipeline
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/back:$BACK_TAG
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/nginx:$NGINX_TAG
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/front:$FRONT_TAG
+            
+            # Deploy with specific tags
+            docker compose up -d --remove-orphans --force-recreate
+            
+            # Run migrations
+            docker compose exec -T back php artisan migrate --force
+            
+            # Cache routes
+            docker compose exec -T back php artisan route:cache
+            
+            # Clean up old images
+            docker image prune -f
+            
+            # Logout from registry
+            docker logout ${{ env.REGISTRY }}
